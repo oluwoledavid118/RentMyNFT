@@ -95,10 +95,7 @@
   (max-duration uint)
   (collateral-required uint)
 )
-  (let (
-    (rental-id (var-get next-rental-id))
-    (nft-contract-principal (contract-of nft-contract))
-  )
+  (begin
     ;; Validate inputs
     (asserts! (> price-per-block u0) ERR_INVALID_AMOUNT)
     (asserts! (>= min-duration MIN_RENTAL_DURATION) ERR_INVALID_DURATION)
@@ -107,41 +104,49 @@
     (asserts! (>= collateral-required u0) ERR_INVALID_AMOUNT)
     
     ;; Check NFT ownership
-    (match (contract-call? nft-contract get-owner token-id)
-      success (asserts! (is-eq (some tx-sender) success) ERR_NOT_AUTHORIZED)
-      error (err error)
+    (let ((ownership-check (contract-call? nft-contract get-owner token-id)))
+      (match ownership-check
+        success (begin
+                  (asserts! (is-eq (some tx-sender) success) ERR_NOT_AUTHORIZED)
+                  (let (
+                    (rental-id (var-get next-rental-id))
+                    (nft-contract-principal (contract-of nft-contract))
+                  )
+                    ;; Ensure NFT is not already listed
+                    (asserts! (is-none (map-get? nft-to-rental { nft-contract: nft-contract-principal, token-id: token-id })) ERR_ALREADY_EXISTS)
+                    
+                    ;; Create rental listing
+                    (map-set rental-listings
+                      { rental-id: rental-id }
+                      {
+                        nft-contract: nft-contract-principal,
+                        token-id: token-id,
+                        owner: tx-sender,
+                        price-per-block: price-per-block,
+                        min-duration: min-duration,
+                        max-duration: max-duration,
+                        collateral-required: collateral-required,
+                        is-active: true,
+                        created-at: stacks-block-height
+                      }
+                    )
+                    
+                    ;; Map NFT to rental ID
+                    (map-set nft-to-rental
+                      { nft-contract: nft-contract-principal, token-id: token-id }
+                      { rental-id: rental-id }
+                    )
+                    
+                    ;; Increment rental ID counter
+                    (var-set next-rental-id (+ rental-id u1))
+                    
+                    (print { event: "nft-listed", rental-id: rental-id, nft-contract: nft-contract-principal, token-id: token-id, owner: tx-sender })
+                    (ok rental-id)
+                  )
+                )
+        error (err error)
+      )
     )
-    
-    ;; Ensure NFT is not already listed
-    (asserts! (is-none (map-get? nft-to-rental { nft-contract: nft-contract-principal, token-id: token-id })) ERR_ALREADY_EXISTS)
-    
-    ;; Create rental listing
-    (map-set rental-listings
-      { rental-id: rental-id }
-      {
-        nft-contract: nft-contract-principal,
-        token-id: token-id,
-        owner: tx-sender,
-        price-per-block: price-per-block,
-        min-duration: min-duration,
-        max-duration: max-duration,
-        collateral-required: collateral-required,
-        is-active: true,
-        created-at: block-height
-      }
-    )
-    
-    ;; Map NFT to rental ID
-    (map-set nft-to-rental
-      { nft-contract: nft-contract-principal, token-id: token-id }
-      { rental-id: rental-id }
-    )
-    
-    ;; Increment rental ID counter
-    (var-set next-rental-id (+ rental-id u1))
-    
-    (print { event: "nft-listed", rental-id: rental-id, nft-contract: nft-contract-principal, token-id: token-id, owner: tx-sender })
-    (ok rental-id)
   )
 )
 
@@ -151,66 +156,71 @@
   (duration uint)
   (nft-contract <nft-trait>)
 )
-  (let (
-    (listing (unwrap! (map-get? rental-listings { rental-id: rental-id }) ERR_NOT_FOUND))
-    (total-cost (* (get price-per-block listing) duration))
-    (platform-fee (/ (* total-cost PLATFORM_FEE_BASIS_POINTS) BASIS_POINTS))
-    (owner-payment (- total-cost platform-fee))
-    (collateral-required (get collateral-required listing))
-    (end-block (+ block-height duration))
-  )
-    ;; Validate rental
-    (asserts! (get is-active listing) ERR_NOT_FOUND)
-    (asserts! (>= duration (get min-duration listing)) ERR_INVALID_DURATION)
-    (asserts! (<= duration (get max-duration listing)) ERR_INVALID_DURATION)
-    (asserts! (is-none (map-get? active-rentals { rental-id: rental-id })) ERR_RENTAL_ACTIVE)
-    (asserts! (is-eq (get nft-contract listing) (contract-of nft-contract)) ERR_INVALID_NFT)
-    
-    ;; Transfer rental payment to owner
-    (try! (stx-transfer? owner-payment tx-sender (get owner listing)))
-    
-    ;; Transfer platform fee
-    (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
-    
-    ;; Handle collateral if required
-    (if (> collateral-required u0)
-      (try! (stx-transfer? collateral-required tx-sender (as-contract tx-sender)))
-      true
+  (begin
+    (let (
+      (listing (unwrap! (map-get? rental-listings { rental-id: rental-id }) ERR_NOT_FOUND))
+      (total-cost (* (get price-per-block listing) duration))
+      (platform-fee (/ (* total-cost PLATFORM_FEE_BASIS_POINTS) BASIS_POINTS))
+      (owner-payment (- total-cost platform-fee))
+      (collateral-required (get collateral-required listing))
+      (end-block (+ stacks-block-height duration))
     )
-    
-    ;; Transfer NFT to renter
-    (match (as-contract (contract-call? nft-contract transfer (get token-id listing) (get owner listing) tx-sender))
-      success (asserts! success ERR_TRANSFER_FAILED)
-      error (err error)
+      ;; Validate rental
+      (asserts! (get is-active listing) ERR_NOT_FOUND)
+      (asserts! (>= duration (get min-duration listing)) ERR_INVALID_DURATION)
+      (asserts! (<= duration (get max-duration listing)) ERR_INVALID_DURATION)
+      (asserts! (is-none (map-get? active-rentals { rental-id: rental-id })) ERR_RENTAL_ACTIVE)
+      (asserts! (is-eq (get nft-contract listing) (contract-of nft-contract)) ERR_INVALID_NFT)
+      
+      ;; Transfer rental payment to owner
+      (try! (stx-transfer? owner-payment tx-sender (get owner listing)))
+      
+      ;; Transfer platform fee
+      (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+      
+      ;; Handle collateral if required
+      (if (> collateral-required u0)
+        (try! (stx-transfer? collateral-required tx-sender (as-contract tx-sender)))
+        true
+      )
+      
+      ;; Transfer NFT to renter
+      (try! (match (as-contract (contract-call? nft-contract transfer (get token-id listing) (get owner listing) tx-sender))
+        success (begin
+                  (asserts! success ERR_TRANSFER_FAILED)
+                  (ok true)
+                )
+        error (err error)
+      ))
+      
+      ;; Create active rental record
+      (map-set active-rentals
+        { rental-id: rental-id }
+        {
+          renter: tx-sender,
+          start-block: stacks-block-height,
+          end-block: end-block,
+          total-cost: total-cost,
+          collateral-amount: collateral-required,
+          returned: false
+        }
+      )
+      
+      ;; Update user rental count
+      (map-set user-rental-count
+        { user: tx-sender }
+        { count: (+ (default-to u0 (get count (map-get? user-rental-count { user: tx-sender }))) u1) }
+      )
+      
+      ;; Update platform earnings
+      (map-set platform-earnings
+        { token: .stx }
+        { amount: (+ (default-to u0 (get amount (map-get? platform-earnings { token: .stx }))) platform-fee) }
+      )
+      
+      (print { event: "nft-rented", rental-id: rental-id, renter: tx-sender, duration: duration, total-cost: total-cost })
+      (ok true)
     )
-    
-    ;; Create active rental record
-    (map-set active-rentals
-      { rental-id: rental-id }
-      {
-        renter: tx-sender,
-        start-block: block-height,
-        end-block: end-block,
-        total-cost: total-cost,
-        collateral-amount: collateral-required,
-        returned: false
-      }
-    )
-    
-    ;; Update user rental count
-    (map-set user-rental-count
-      { user: tx-sender }
-      { count: (+ (default-to u0 (get count (map-get? user-rental-count { user: tx-sender }))) u1) }
-    )
-    
-    ;; Update platform earnings
-    (map-set platform-earnings
-      { token: .stx }
-      { amount: (+ (default-to u0 (get amount (map-get? platform-earnings { token: .stx }))) platform-fee) }
-    )
-    
-    (print { event: "nft-rented", rental-id: rental-id, renter: tx-sender, duration: duration, total-cost: total-cost })
-    (ok true)
   )
 )
 
@@ -225,14 +235,17 @@
   )
     ;; Validate return conditions
     (asserts! (not (get returned rental)) ERR_NOT_FOUND)
-    (asserts! (>= block-height (get end-block rental)) ERR_RENTAL_ACTIVE)
+    (asserts! (>= stacks-block-height (get end-block rental)) ERR_RENTAL_ACTIVE)
     (asserts! (is-eq (get nft-contract listing) (contract-of nft-contract)) ERR_INVALID_NFT)
     
     ;; Transfer NFT back to owner
-    (match (as-contract (contract-call? nft-contract transfer (get token-id listing) (get renter rental) (get owner listing)))
-      success (asserts! success ERR_TRANSFER_FAILED)
+    (try! (match (as-contract (contract-call? nft-contract transfer (get token-id listing) (get renter rental) (get owner listing)))
+      success (begin
+                (asserts! success ERR_TRANSFER_FAILED)
+                (ok true)
+              )
       error (err error)
-    )
+    ))
     
     ;; Return collateral to renter if any
     (if (> (get collateral-amount rental) u0)
@@ -282,4 +295,78 @@
     (var-set platform-treasury new-treasury)
     (ok true)
   )
+)
+
+
+;; read only functions
+
+;; Get rental listing details
+(define-read-only (get-rental-listing (rental-id uint))
+  (map-get? rental-listings { rental-id: rental-id })
+)
+
+;; Get active rental details
+(define-read-only (get-active-rental (rental-id uint))
+  (map-get? active-rentals { rental-id: rental-id })
+)
+
+;; Get rental ID for NFT
+(define-read-only (get-nft-rental-id (nft-contract principal) (token-id uint))
+  (map-get? nft-to-rental { nft-contract: nft-contract, token-id: token-id })
+)
+
+;; Check if rental has expired
+(define-read-only (is-rental-expired (rental-id uint))
+  (match (map-get? active-rentals { rental-id: rental-id })
+    rental (>= stacks-block-height (get end-block rental))
+    false
+  )
+)
+
+;; Get user rental count
+(define-read-only (get-user-rental-count (user principal))
+  (default-to u0 (get count (map-get? user-rental-count { user: user })))
+)
+
+;; Get platform earnings
+(define-read-only (get-platform-earnings (token principal))
+  (default-to u0 (get amount (map-get? platform-earnings { token: token })))
+)
+
+;; Get next rental ID
+(define-read-only (get-next-rental-id)
+  (var-get next-rental-id)
+)
+
+;; Get platform treasury
+(define-read-only (get-platform-treasury)
+  (var-get platform-treasury)
+)
+
+;; Calculate rental cost
+(define-read-only (calculate-rental-cost (rental-id uint) (duration uint))
+  (match (map-get? rental-listings { rental-id: rental-id })
+    listing 
+    (let (
+      (total-cost (* (get price-per-block listing) duration))
+      (platform-fee (/ (* total-cost PLATFORM_FEE_BASIS_POINTS) BASIS_POINTS))
+    )
+      (some {
+        total-cost: total-cost,
+        platform-fee: platform-fee,
+        owner-payment: (- total-cost platform-fee),
+        collateral-required: (get collateral-required listing)
+      })
+    )
+    none
+  )
+)
+
+
+;; private functions
+
+;; Validate NFT contract (helper function)
+(define-private (validate-nft-contract (nft-contract principal))
+  ;; This could be extended to maintain a whitelist of approved NFT contracts
+  true
 )
