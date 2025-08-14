@@ -283,3 +283,68 @@
     (ok true)
   )
 )
+
+
+;; read only functions
+
+;; Get rental listing details
+(define-read-only (get-rental-listing (rental-id uint))
+  (map-get? rental-listings { rental-id: rental-id })
+)
+
+;; Get active rental details
+(define-read-only (get-active-rental (rental-id uint))
+  (map-get? active-rentals { rental-id: rental-id })
+)
+
+;; Get rental ID for NFT
+(define-read-only (get-nft-rental-id (nft-contract principal) (token-id uint))
+  (map-get? nft-to-rental { nft-contract: nft-contract, token-id: token-id })
+)
+
+;; Check if rental has expired
+(define-read-only (is-rental-expired (rental-id uint))
+  (match (map-get? active-rentals { rental-id: rental-id })
+    rental (>= block-height (get end-block rental))
+    false
+  )
+)
+
+;; Get user rental count
+(define-read-only (get-user-rental-count (user principal))
+  (default-to u0 (get count (map-get? user-rental-count { user: user })))
+)
+
+;; Get platform earnings
+(define-read-only (get-platform-earnings (token principal))
+  (default-to u0 (get amount (map-get? platform-earnings { token: token })))
+)
+
+;; Get next rental ID
+(define-read-only (get-next-rental-id)
+  (var-get next-rental-id)
+)
+
+;; Get platform treasury
+(define-read-only (get-platform-treasury)
+  (var-get platform-treasury)
+)
+
+;; Calculate rental cost
+(define-read-only (calculate-rental-cost (rental-id uint) (duration uint))
+  (match (map-get? rental-listings { rental-id: rental-id })
+    listing 
+    (let (
+      (total-cost (* (get price-per-block listing) duration))
+      (platform-fee (/ (* total-cost PLATFORM_FEE_BASIS_POINTS) BASIS_POINTS))
+    )
+      (some {
+        total-cost: total-cost,
+        platform-fee: platform-fee,
+        owner-payment: (- total-cost platform-fee),
+        collateral-required: (get collateral-required listing)
+      })
+    )
+    none
+  )
+)
